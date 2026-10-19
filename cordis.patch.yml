@@ -1,0 +1,6 @@
+# Debug bridge bundle patch: inserts its dsh.client row into the web roster.
+# `name` is the module specifier resolved from the profile directory, so it
+# follows the package name (dsh-gui-bridge), not the plugin's own id.
+- insert:
+    - id: ui-desktop-bridge
+      name: 'dsh-gui-bridge'

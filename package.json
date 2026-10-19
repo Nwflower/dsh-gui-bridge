@@ -1,0 +1,66 @@
+{
+  "name": "dsh-gui-bridge",
+  "version": "0.3.0",
+  "description": "Debug bridge into the DSH browser half: run expressions in the GUI page from a command line or a model tool. | DSH 调试桥接：从命令行或模型工具在 GUI 页面里执行表达式。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dsh-gui-bridge": "./bin/bridge.cjs",
+    "dsh-desktop-bridge": "./bin/bridge.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nwflower/dsh-gui-bridge.git"
+  },
+  "homepage": "https://github.com/Nwflower/dsh-gui-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/Nwflower/dsh-gui-bridge/issues"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "probes",
+    "cordis.patch.yml",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.5-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "scripts": {
+    "bridge": "node bin/bridge.cjs",
+    "test": "node test/bridge.test.cjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "cordis",
+    "debug",
+    "bridge",
+    "devtools"
+  ],
+  "license": "MIT",
+  "author": "Nwflower"
+}
