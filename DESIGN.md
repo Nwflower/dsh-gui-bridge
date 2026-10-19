@@ -150,6 +150,21 @@
 - 宿主卸载（插件停用或宿主退出）：挂着的轮询全部结束，在途命令回 503。
 - 端口不是默认值：命令行用 `--port` 指定。
 
+## 源码布局与构建
+
+两半的源码在 `src/`，产物在 `lib/`，**`lib/` 不入库**（与 `dsh-perf-lens`、`dsh-widget-board` 一致）。构建用 tsdown，两个入口：
+
+- `src/host/index.ts` → `lib/index.js`（ESM）与 `lib/index.d.ts`。`@deepseek-ai/*` 由宿主提供，留在产物里当 import；其余内联。
+- `src/client/index.ts` → `lib/client.js`（CJS）。加载器工厂包装由 `banner`/`intro`/`footer` 生成，源码只是普通模块；`CLIENT_VERSION` 由构建从 `package.json` 注入（`define`）——这一条原来是在源码里手抄的第二个版本号，与 `package.json` 漂移过一次就再没人发现。
+
+为什么这么切：浏览器半边原来手抄了一份「构建产物」的样板（工厂包装、`module`/`exports` 骨架、`Symbol.toStringTag`）。那几行是加载器的约定，不是这个插件的逻辑，抄错只会在页面里变成一句看不出所以然的报错；现在它由构建产出，与其它 `dsh.client` 包同形。
+
+`src/shared/protocol.ts` 是两半之间的线协议类型：命令（`ExecCommand` / `RecordCommand` / `InspectCommand`）、录制与检查的参数、回答信封。此前两侧各自维护同名常量与形状，一侧改名不会有任何编译期信号，只有端到端测试能发现；现在一侧改形状，另一侧立刻不通过类型检查。
+
+`bin/bridge.cjs` 与 `probes/*.js` 不参与构建：前者是命令行入口，后者是要在页面启动时求值的探针脚本，都按原样发布。
+
+命令：`npm run build`、`npm run dev`、`npm run typecheck`、`npm test`、`npm run verify`。`prepack` 在打包前构建一次，因此发布包始终带 `lib/`。
+
 ## 验证
 
 已完成两轮：
@@ -162,6 +177,25 @@
 实测得到三条约束，都已写进上面的设计与安装说明：读取 `ctx.config` 需要 inject 声明，否则整条插件不激活；宿主的 `requestRejection()` 对无 cookie 的命令行请求回 401；`@deepseek-ai/dsh-tools` 在符号链接安装下解析不到，插件会以 `failed to import` 停用。另外输出模式里的对象节点必须显式写出 `additionalProperties`，漏写会让 `defineTool` 在注册时抛错。
 
 桌面端实测：把插件装进桌面 profile 的依赖与 bundles 后重启应用，重复第 2 轮的命令行查询。只加依赖、不列进 bundles 时，客户端半边会被加载并轮询一个不存在的路由（实测到 404 刷屏），因此安装必须同时改这两处。
+
+### 第三轮：迁到 TypeScript（源码在 `src/`，`lib/` 成为产物）
+
+两半原本是手写 JS，`lib/` 就是源码。现在源码在 `src/`（TypeScript，strict），产物由 tsdown 生成，`lib/` 不入库。迁移只加类型，不改行为，并且是**机械证明**的：
+
+1. **同一管线前后各构建一次。** 迁移前的源码是手写 JS 的逐字副本，先用最终的 tsdown 配置构建一份留作基准；类型化完成后再构建一次，两份产物逐行比对。结果：宿主半边**连注释都逐字符一致**；浏览器半边只有一段新增的注释不同，可执行行完全相同（注释也参与比对的那一遍之外，另有一遍剥掉注释与空行，两半都完全一致）。唯一的有意差异是 `PROTOCOL_VERSION` 改为从 `src/shared/protocol.ts` 内联，值不变。
+2. **版本注入证伪。** 把 `package.json` 的 `version` 临时改成 `9.9.9`，构建产物里的 `CLIENT_VERSION` 随之变成 `"9.9.9"`，改回后恢复 `"0.3.0"`。这一步确认注入是活的，而不是「恰好也是 0.3.0」。
+3. **端到端。** 自带测试的 128 项检查在构建产物上全过；其中「status reports both versions」改为拿 `package.json` 的版本比对，因此注入断掉会直接失败，而不是继续绿着。
+
+迁移后 `tsc --noEmit` 全项目 0 错误。宿主半边没有写下一个 `any`；浏览器半边的 `any` 只出现在真正不透明的 JSON 上（求值结果、录制条目、`JSON.parse` 的返回、被包装的 `console`/`fetch`/`XHR`/`WebSocket` 的实参与 `this`），每一处都在报告里逐条列了理由。
+
+两半的类型化同时暴露出若干**原有代码**的问题，本轮只记录、不修：
+
+- `status()` 里的 `record` 与 `endpoint` 用 `?? null` 输出，与「没有值的字段省略，不写 null」这条既有约定冲突（见 v0.2 一节）。
+- `recordArgs` 可能返回 `action: 'export'`，而线协议里页面的动作集只有 `start`/`read`/`stop`：宿主的动作集比页面宽，这个「宽」此前只存在于代码里，没有类型表达。
+- `onNext` 在 `wait=0` 时不挂定时器（`if (waitMs > 0)`），而 `queryInt(..., 0, MAX_POLL_WAIT_MS)` 明确允许 0：这样的长轮询只能等到 socket 关闭。
+- `dispose()` 清空队列与在途命令，却留下 `onPollListener` 与 `flags.endpoint`：路由卸载后若还有一次轮询到达，会把已经删掉的端点文件写回来。
+- 页面侧：WebSocket 发 `Blob` 帧时记成 `size: 0`（Blob 用 `size` 而不是 `byteLength`）；`MessageEvent.data` 的取值器把每个 `message` 事件都记成 `ws-message`，`window.postMessage` 也在内。
+- `read()` 的 `nextSeq` 表示「游标未动」，`stop()` 的 `nextSeq` 表示「最后一个序号」：同一字段两种含义。
 
 ## v0.2：失败路径与生命周期（已落地）
 

@@ -13,6 +13,32 @@ Debug bridge into the DSH browser half: run expressions in the GUI page from a c
 - `cordis.patch.yml` 里的 `name` 是「从 profile 目录解析的模块说明符」，它必须等于包名，因此已改成 `dsh-gui-bridge`；
 - 命令行同时提供 `dsh-gui-bridge` 与 `dsh-desktop-bridge` 两个名字，指向同一个入口；下文示例沿用后者。
 
+## 构建
+
+源码在 `src/`，产物在 `lib/`，**`lib/` 是构建产物、不入库**（与同目录的 `dsh-perf-lens`、`dsh-widget-board` 一致）。改完源码必须构建一次，宿主半边才会加载到新代码：
+
+```sh
+npm install
+npm run build      # tsdown：src/ -> lib/
+npm run dev        # tsdown --watch
+npm run typecheck  # tsc --noEmit
+npm test           # 自带端到端测试（真实无头浏览器）
+npm run verify     # typecheck + build + test
+```
+
+两个入口：
+
+| 源码 | 产物 | 形态 |
+| --- | --- | --- |
+| `src/host/index.ts` | `lib/index.js` + `lib/index.d.ts` | ESM，宿主进程按 `exports["."]` 导入并调用 `apply(ctx)` |
+| `src/client/index.ts` | `lib/client.js` | CJS，包在页面模块加载器的工厂包装里 |
+
+浏览器半边的 `window.__ModuleLoader__.load({ id, factory })` 包装、`module`/`exports` 骨架与 `Symbol.toStringTag` **由构建生成**（`tsdown.config.ts` 的 `banner`/`intro`/`footer`），源码只是一个普通模块，导出 `apply`。它上报的 `CLIENT_VERSION` 由构建从 `package.json` 注入，不再手抄。
+
+两半之间的线协议类型在 `src/shared/protocol.ts`：命令、录制与检查参数、回答信封都从这里来，改名会同时落在两侧。`bin/bridge.cjs`（命令行）与 `probes/*.js`（页面探针）保持纯 JS，不参与构建。
+
+`npm pack` / `npm publish` 前由 `prepack` 自动构建，因此发布包始终带 `lib/`。
+
 ## 安装
 
 在目标 profile（桌面端是 `~/.dsh/profiles/desktop`）的 `package.json` 里加依赖与 bundle：
@@ -20,7 +46,7 @@ Debug bridge into the DSH browser half: run expressions in the GUI page from a c
 ```json
 {
   "dependencies": {
-    "dsh-gui-bridge": "link:D:/DSH/dsh-desktop-bridge"
+    "dsh-gui-bridge": "link:D:/DSH/dsh-gui-bridge"
   },
   "dsh": {
     "profile": {
@@ -30,7 +56,7 @@ Debug bridge into the DSH browser half: run expressions in the GUI page from a c
 }
 ```
 
-然后在 profile 目录里执行 `pnpm install`，重启应用。
+`link:` 指向源码目录，所以先在本仓库里 `npm install && npm run build`（`lib/` 不入库，没有产物插件会以「failed to import」停用）。然后在 profile 目录里执行 `pnpm install`，重启应用。
 
 两处都要改：插件管理器安装本地路径时只写依赖，`dsh.profile.bundles` 仍要自己加上；只加依赖的话，页面里的客户端半边会被加载并轮询一个不存在的路由，控制台会报 404。
 
@@ -140,9 +166,11 @@ since your previous call (12.3s ago): title "设置页" → "看板"; data-dsh-c
 工具库 `@deepseek-ai/dsh-tools` 由 harness 提供。插件以符号链接（`link:`）安装时，harness 的包名解析不到这个库，需要在插件目录下建一个指向 harness 同名包的目录联接：
 
 ```sh
-New-Item -ItemType Junction -Path D:\DSH\dsh-desktop-bridge\node_modules\@deepseek-ai\dsh-tools `
+New-Item -ItemType Junction -Path D:\DSH\dsh-gui-bridge\node_modules\@deepseek-ai\dsh-tools `
   -Target <harness>\node_modules\@deepseek-ai\dsh-tools
 ```
+
+注意：本仓库的 `npm install` 会把这个目录联接当作多余的包删掉（peer 依赖由 harness 在运行时提供，npm 不认）。装完依赖后确认它还在，不在就重建一次。
 
 安装成真实目录（把插件复制进 profile 的 `node_modules`）时，harness 会解析自己的副本，不需要这一步。
 

@@ -439,9 +439,15 @@ async function main() {
       check('status reports a live browser half',
         liveStatus.agent.state === 'live' && typeof liveStatus.agent.lastPollMsAgo === 'number' && liveStatus.agent.waiters >= 0,
         JSON.stringify(liveStatus.agent))
+      // The browser half reports the version the build injected from
+      // package.json (tsdown `define`), so comparing against the manifest here
+      // is what catches a broken injection — the number used to be typed into
+      // the source by hand and could drift from the package without a signal.
+      const manifestVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
       check('status reports both versions',
-        typeof liveStatus.versions.host === 'string' && liveStatus.versions.client === '0.3.0' && liveStatus.versions.clientProtocol === 1,
-        JSON.stringify(liveStatus.versions))
+        typeof liveStatus.versions.host === 'string' && liveStatus.versions.host === manifestVersion &&
+          liveStatus.versions.client === manifestVersion && liveStatus.versions.clientProtocol === 1,
+        JSON.stringify(liveStatus.versions) + ' manifest ' + manifestVersion)
       check('status renders model-facing text',
         statusTool.output.render({}, liveStatus)[0].text.includes('agent: live') && statusTool.output.render({}, liveStatus)[0].text.includes('versions:'),
         statusTool.output.render({}, liveStatus)[0].text.slice(0, 240))

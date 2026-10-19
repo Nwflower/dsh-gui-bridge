@@ -2,3 +2,9 @@ node_modules/
 .debug/
 *.log
 .tmp/
+
+# Build output: `npm run build` writes lib/ from src/. Never committed.
+lib/
+
+# npm pack / publish artifacts
+*.tgz

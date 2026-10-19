@@ -36,7 +36,23 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { InferValue, ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { PROTOCOL_VERSION } from '../shared/protocol'
+import type {
+  Answer,
+  Command,
+  ConsoleEntry,
+  ErrorPayload,
+  ExecCommand,
+  InspectArgs,
+  InspectCommand,
+  PageInfo,
+  RecordArgs,
+  RecordCommand,
+  SinceView,
+} from '../shared/protocol'
 
 export const name = 'dsh-desktop-bridge'
 
@@ -101,8 +117,6 @@ const RECORDING_KEEP = 20
 const OPERATOR_LABEL = 'the command line'
 /** Deadline for one recording action, in ms: the actions themselves are quick. */
 const RECORD_TIMEOUT_MS = 15000
-/** Protocol version shared by both halves; a mismatch is reported, not fatal. */
-const PROTOCOL_VERSION = 1
 /** This package's version, read once for the status answer. */
 const HOST_VERSION = (() => {
   try {
@@ -124,6 +138,45 @@ const INSPECT_MAX_LIMIT = 50
 /** Largest serialized inspect answer, in characters. */
 const INSPECT_MAX_BUDGET = 65_536
 
+/** One value the page produced: JSON whose shape the page owns, narrowed at every read. */
+type PageValue = Answer['value']
+
+/** A caught value, read for an optional message; what is thrown is not known statically. */
+type ThrownValue = { readonly message?: unknown } | null | undefined
+
+/** A timer handle as this module stores it: null before one is armed. */
+type TimerHandle = ReturnType<typeof setTimeout>
+
+/** One request body, before any field is checked: every field the five routes read. */
+interface RequestBody {
+  action?: unknown
+  code?: unknown
+  timeoutMs?: unknown
+  source?: unknown
+  id?: unknown
+  ok?: unknown
+  value?: unknown
+  error?: ErrorPayload
+  ms?: unknown
+  page?: PageInfo
+  console?: ConsoleEntry[]
+  since?: SinceView
+  channels?: unknown
+  selector?: unknown
+  maxMs?: unknown
+  limit?: unknown
+  afterSeq?: unknown
+  runId?: unknown
+}
+
+/**
+ * One recording action's arguments as a caller named them. The action stays a
+ * plain string: `export` is answered by the host half and never reaches the page.
+ */
+interface RecordingArgs extends Omit<RecordArgs, 'action'> {
+  action: string
+}
+
 /**
  * One recording action's arguments, taken from the declared fields only, so the
  * page's recorder never sees a key this plugin did not promise it.
@@ -131,9 +184,9 @@ const INSPECT_MAX_BUDGET = 65_536
  * @param body - the caller's payload.
  * @returns the arguments to send.
  */
-function recordArgs(action, body) {
-  const args = { action }
-  if (Array.isArray(body.channels)) args.channels = body.channels.filter((name) => typeof name === 'string')
+function recordArgs(action: string, body: RequestBody): RecordingArgs {
+  const args: RecordingArgs = { action }
+  if (Array.isArray(body.channels)) args.channels = body.channels.filter((name: unknown) => typeof name === 'string')
   if (typeof body.selector === 'string') args.selector = body.selector
   if (typeof body.maxMs === 'number') args.maxMs = body.maxMs
   if (typeof body.limit === 'number') args.limit = body.limit
@@ -183,7 +236,7 @@ const BOOT_LOADER = `(() => {
  * @param parts - path segments below `dsh-desktop-bridge`.
  * @returns the absolute directory path.
  */
-function pluginDirectory(...parts) {
+function pluginDirectory(...parts: string[]): string {
   return join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'dsh-desktop-bridge', ...parts)
 }
 
@@ -206,7 +259,7 @@ function endpointDirectory() {
  * @param text - the full JSON text of the answer's value.
  * @returns the file path.
  */
-function writeSpill(id, text) {
+function writeSpill(id: string, text: string): string {
   const directory = pluginDirectory('results')
   mkdirSync(directory, { recursive: true })
   const file = join(directory, `${id}.json`)
@@ -233,10 +286,10 @@ const SPILL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
  *          output schema declares.
  * @throws when the id is not a spill id, or no such file is kept.
  */
-function readSpill(id, offset) {
+function readSpill(id: string, offset: number | undefined): Answer {
   if (!SPILL_ID.test(id)) throw new Error('desktop_eval: `spill` must be the id an earlier answer reported')
   const file = join(pluginDirectory('results'), `${id}.json`)
-  let text
+  let text: string
   try {
     text = readFileSync(file, 'utf8')
   } catch {
@@ -245,7 +298,7 @@ function readSpill(id, offset) {
   const from = clampInt(offset, 0, 0, text.length)
   const slice = text.slice(from, from + RENDER_LIMIT_CHARS)
   const next = from + slice.length
-  const answer = {
+  const answer: Answer = {
     id,
     ok: true,
     value: slice,
@@ -254,7 +307,7 @@ function readSpill(id, offset) {
   }
   // The output schema declares a single type per field, so "there is no next
   // slice" is an absent key, never a null.
-  if (next < text.length) answer.spill.nextOffset = next
+  if (next < text.length) answer.spill!.nextOffset = next
   return answer
 }
 
@@ -263,9 +316,9 @@ function readSpill(id, offset) {
  * @param answer - the bridge's answer.
  * @returns the answer, with `spill` when the value was written to a file.
  */
-function withSpill(answer) {
+function withSpill(answer: Answer): Answer {
   if (answer === null || typeof answer !== 'object' || answer.ok !== true) return answer
-  let text
+  let text: string | undefined
   try {
     text = JSON.stringify(answer.value)
   } catch {
@@ -314,7 +367,7 @@ const TOOL_PARAMETERS = {
   timeoutMs: { type: 'number', description: TOOL_TIMEOUT_DESCRIPTION },
   spill: { type: 'string', description: TOOL_SPILL_DESCRIPTION },
   offset: { type: 'number', description: TOOL_OFFSET_DESCRIPTION },
-}
+} as const
 
 /** The model-facing name of the recorder tool. */
 const RECORD_TOOL_NAME = 'desktop_record'
@@ -342,7 +395,7 @@ const RECORD_PARAMETERS = {
   afterSeq: { type: 'number', description: 'read: return entries whose sequence number is above this; continue from the `nextSeq` an earlier read reported.' },
   limit: { type: 'number', description: 'read: how many entries to return, default 200, maximum 1000.' },
   timeoutMs: { type: 'number', description: 'Deadline for this action in milliseconds, default 15000.' },
-}
+} as const
 
 /** The model-facing name of the diagnostic tool. */
 const STATUS_TOOL_NAME = 'desktop_status'
@@ -352,7 +405,7 @@ const STATUS_TOOL_DESCRIPTION =
   'and any active recording. Call this after a timeout or an unavailable answer, before retrying a mutating expression. ' +
   'It is read-only and cheap: it never queues a command for the page.'
 /** The diagnostic tool has no parameters. */
-const STATUS_PARAMETERS = {}
+const STATUS_PARAMETERS = {} as const
 
 /** The model-facing name of the read-only inspection tool. */
 const INSPECT_TOOL_NAME = 'desktop_inspect'
@@ -371,7 +424,7 @@ const INSPECT_PARAMETERS = {
   limit: { type: 'number', description: `Maximum entries per selector, default 5, maximum ${String(INSPECT_MAX_LIMIT)}.` },
   budget: { type: 'number', description: `Maximum serialized characters, default ${String(RENDER_LIMIT_CHARS)}, maximum ${String(INSPECT_MAX_BUDGET)}.` },
   timeoutMs: { type: 'number', description: 'Deadline for the whole call in milliseconds, default 15000, maximum 120000.' },
-}
+} as const
 
 /** The model-facing name of the late-result tool. */
 const WAIT_TOOL_NAME = 'desktop_wait'
@@ -384,7 +437,7 @@ const WAIT_TOOL_DESCRIPTION =
 const WAIT_PARAMETERS = {
   commandId: { type: 'string', required: true, description: 'The command id an earlier desktop_eval or desktop_record answer reported.' },
   waitMs: { type: 'number', description: `How long to wait, default 5000, maximum ${String(WAIT_MAX_MS)}.` },
-}
+} as const
 
 /**
  * The answer envelope both tools declare: the bridge's own fields, with `value`
@@ -421,7 +474,7 @@ const ANSWER_SCHEMA = {
     waiting: { type: 'boolean' },
     late: { type: 'boolean' },
   },
-}
+} as const
 
 /**
  * The status answer. Its fields are diagnostic prose and counters rather than
@@ -442,7 +495,7 @@ const STATUS_SCHEMA = {
     limits: { type: 'json' },
     endpoint: { type: 'json' },
   },
-}
+} as const
 
 /**
  * Refuse an argument the tool's own parameters do not declare.
@@ -455,7 +508,7 @@ const STATUS_SCHEMA = {
  * @param args - the model's arguments.
  * @throws when an argument is undeclared.
  */
-function assertDeclaredArguments(toolName, declared, args) {
+function assertDeclaredArguments(toolName: string, declared: string[], args: unknown): void {
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     throw new Error(`${toolName}: invalid arguments; this tool accepts ${declared.join(', ')}`)
   }
@@ -466,7 +519,7 @@ function assertDeclaredArguments(toolName, declared, args) {
 }
 
 /** Stable source keys for callers that have no string session id. */
-const anonymousSources = new WeakMap()
+const anonymousSources = new WeakMap<object, string>()
 let anonymousSourceSeq = 0
 
 /**
@@ -479,7 +532,7 @@ let anonymousSourceSeq = 0
  * @param exec - the tool execution context.
  * @returns the source key.
  */
-function sourceOf(exec) {
+function sourceOf(exec: ToolRunContext | undefined): string {
   const session = exec?.agent?.session
   if (session === undefined || session === null) return 'operator'
   if (typeof session.id === 'string' && session.id !== '') return `session:${session.id}`
@@ -492,7 +545,7 @@ function sourceOf(exec) {
 }
 
 /** The source key an HTTP body names, or the operator. */
-function routeSource(body) {
+function routeSource(body: RequestBody): string {
   return typeof body.source === 'string' && body.source !== '' ? body.source : 'operator'
 }
 
@@ -505,7 +558,7 @@ function routeSource(body) {
  * @param req - node request.
  * @returns true for 127.0.0.0/8, ::1 and their IPv4-mapped forms.
  */
-function isLoopback(req) {
+function isLoopback(req: IncomingMessage): boolean {
   const address = req.socket?.remoteAddress ?? ''
   return address === '::1' || address.startsWith('127.') || address.startsWith('::ffff:127.')
 }
@@ -523,11 +576,11 @@ function isLoopback(req) {
  * @param req - node request.
  * @returns 403, or undefined when the request may proceed.
  */
-function refusalOf(req) {
+function refusalOf(req: IncomingMessage): number | undefined {
   if (!isLoopback(req)) return 403
   const host = req.headers.host
   if (host !== undefined) {
-    let name
+    let name: string
     try {
       name = new URL(`http://${host}`).hostname
     } catch {
@@ -547,12 +600,12 @@ function refusalOf(req) {
 }
 
 /** Send one JSON response; a caller that already left is not an error. */
-function sendJson(res, status, payload) {
+function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   let body
   try {
     body = Buffer.from(JSON.stringify(payload ?? null))
   } catch (error) {
-    body = Buffer.from(JSON.stringify({ error: `unserialisable payload: ${error?.message ?? error}` }))
+    body = Buffer.from(JSON.stringify({ error: `unserialisable payload: ${(error as ThrownValue)?.message ?? error}` }))
     status = 500
   }
   try {
@@ -571,11 +624,11 @@ function sendJson(res, status, payload) {
  * @param limit - byte cap.
  * @returns the parsed value.
  */
-function readBody(req, limit) {
-  return new Promise((resolve, reject) => {
-    const chunks = []
+function readBody(req: IncomingMessage, limit: number): Promise<RequestBody> {
+  return new Promise<RequestBody>((resolve, reject) => {
+    const chunks: Buffer[] = []
     let size = 0
-    req.on('data', (chunk) => {
+    req.on('data', (chunk: Buffer) => {
       size += chunk.byteLength
       if (size > limit) {
         reject(new Error(`body larger than ${limit} bytes`))
@@ -594,29 +647,116 @@ function readBody(req, limit) {
       try {
         resolve(JSON.parse(text))
       } catch (error) {
-        reject(new Error(`body is not JSON: ${error?.message ?? error}`))
+        reject(new Error(`body is not JSON: ${(error as ThrownValue)?.message ?? error}`))
       }
     })
   })
 }
 
 /** One query value as an integer, clamped, or the fallback. */
-function queryInt(req, key, fallback, min, max) {
+function queryInt(req: IncomingMessage, key: string, fallback: number, min: number, max: number): number {
   const raw = new URL(req.url ?? '/', 'http://x').searchParams.get(key)
   if (raw === null) return fallback
   return clampInt(Number(raw), fallback, min, max)
 }
 
 /** A number clamped into range, or the fallback when it is not finite. */
-function clampInt(value, fallback, min, max) {
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
   return Math.min(max, Math.max(min, Math.round(value)))
 }
 
 /** One error payload in the shape the browser half sends. */
-function errorPayload(name, message) {
+function errorPayload(name: string, message: string): ErrorPayload {
   return { __type: 'error', name, message, stack: null }
 }
+
+/** What `state` reports about the endpoint file, so a command line can ask why it is missing. */
+interface EndpointStatus {
+  file: string
+  port: number | null
+  error: string | null
+}
+
+/** Shared status flags the owner sets. */
+interface BridgeFlags {
+  /** Whether the model-facing tools are registered, reported by `state`. */
+  tool: boolean
+  /** Absent until the routes mount, which is when the endpoint file is placed. */
+  endpoint?: EndpointStatus
+}
+
+/** The agent session a tool call carries; the recording ownership rule compares it. */
+type SessionHandle = NonNullable<NonNullable<ToolRunContext['agent']>['session']>
+
+/** One long poll the browser half is holding open. */
+interface Waiter {
+  res: ServerResponse
+  timer: TimerHandle | null
+  done: boolean
+}
+
+/** One held caller, by command id. */
+interface PendingEntry {
+  done: boolean
+  timer: TimerHandle | null
+  settle: (payload: Answer) => void
+}
+
+/** One late result kept for `desktop_wait`. */
+interface LateResult {
+  at: number
+  payload: Answer
+}
+
+/** The one recording in the page, and who holds it. */
+interface RecordingState {
+  owner: SessionHandle | null
+  ownerLabel: string
+  running: boolean
+  channels: string[]
+  selector: string | null
+  startedAt: number
+  runId?: string
+}
+
+/** What `status()` reports: the diagnostic snapshot shared by `/state` and `desktop_status`. */
+interface BridgeStatus {
+  agent: { state: string; lastPollMsAgo: number | null; stale: boolean; waiters: number }
+  queue: number
+  pending: number
+  served: number
+  tool: boolean
+  record: {
+    running: boolean
+    owner: string
+    channels: string[]
+    selector: string | null
+    startedAt: number
+    runId?: string
+  } | null
+  page?: PageInfo
+  versions: { host: string; protocol: number; client?: string; clientProtocol?: number }
+  limits: {
+    defaultExecTimeoutMs: number
+    maxExecTimeoutMs: number
+    maxPollWaitMs: number
+    renderLimitChars: number
+    spillKeep: number
+    recordMaxMs: number
+    recordMaxEntries: number
+    inspectMaxSelectors: number
+    inspectMaxLimit: number
+    inspectMaxBudget: number
+  }
+  endpoint: EndpointStatus | null
+}
+
+/** One command's payload, before the queue adds its id, deadline and expiry. */
+type CommandDraft =
+  | Omit<ExecCommand, 'id' | 'timeoutMs' | 'expiresAt'>
+  | Omit<RecordCommand, 'id' | 'timeoutMs' | 'expiresAt'>
+  | Omit<InspectCommand, 'id' | 'timeoutMs' | 'expiresAt'>
 
 /**
  * The queue, the held callers and the waiting polls.
@@ -628,24 +768,24 @@ function errorPayload(name, message) {
  *   registered, reported by `state`).
  * @returns the two faces' handlers plus their status.
  */
-function createBridge(flags) {
+function createBridge(flags: BridgeFlags) {
   /** Expressions waiting for a browser half to poll. */
-  const queue = []
+  const queue: Command[] = []
   /** Held callers by command id: routes settle a response, the tool a promise. */
-  const pending = new Map()
+  const pending = new Map<string, PendingEntry>()
   /** Long polls waiting for an expression. */
-  const waiters = []
+  const waiters: Waiter[] = []
   let lastPollAt = 0
   let served = 0
   /** The last page information a result carried, for `desktop_status`. */
-  let lastPage
+  let lastPage: PageInfo | undefined
   /** The browser half's own version and protocol, learned from its poll. */
-  let lastClientVersion
-  let lastClientProtocol
+  let lastClientVersion: string | undefined
+  let lastClientProtocol: number | undefined
   /** Late results kept for `desktop_wait`, keyed by command id. */
-  const recent = new Map()
+  const recent = new Map<string, LateResult>()
   /** Told on every poll: the owner records the endpoint once a port is known. */
-  let onPollListener = null
+  let onPollListener: (() => void) | null = null
 
   /** Drop expired late results; called before every read/write of `recent`. */
   const pruneRecent = () => {
@@ -661,13 +801,13 @@ function createBridge(flags) {
   }
 
   /** Keep one late result for `desktop_wait`. */
-  const remember = (id, payload) => {
+  const remember = (id: string, payload: Answer): void => {
     recent.delete(id)
     recent.set(id, { at: Date.now(), payload })
     pruneRecent()
   }
 
-  const dropWaiter = (waiter) => {
+  const dropWaiter = (waiter: Waiter): void => {
     const at = waiters.indexOf(waiter)
     if (at !== -1) waiters.splice(at, 1)
     if (waiter.timer !== null) clearTimeout(waiter.timer)
@@ -675,7 +815,7 @@ function createBridge(flags) {
   }
 
   /** Answer a waiting poll with one command, or with 204 when it timed out. */
-  const settleWaiter = (waiter, command) => {
+  const settleWaiter = (waiter: Waiter, command?: Command): void => {
     if (waiter.done) return
     dropWaiter(waiter)
     if (command === undefined) {
@@ -689,7 +829,7 @@ function createBridge(flags) {
   }
 
   /** Hand one command to a waiting poll, or queue it. */
-  const dispatch = (command) => {
+  const dispatch = (command: Command): void => {
     const waiter = waiters.shift()
     if (waiter === undefined) {
       queue.push(command)
@@ -699,13 +839,13 @@ function createBridge(flags) {
   }
 
   /** Milliseconds since the newest poll, or null when this host half has seen none. */
-  const agentSeenMsAgo = () => (lastPollAt === 0 ? null : Date.now() - lastPollAt)
+  const agentSeenMsAgo = (): number | null => (lastPollAt === 0 ? null : Date.now() - lastPollAt)
 
   /**
    * The await window the page gets for one call: the deadline, less the margin
    * that lets the page answer before the host half stops waiting.
    */
-  const pageAwaitMs = (timeoutMs) => Math.max(PAGE_AWAIT_MIN_MS, timeoutMs - PAGE_AWAIT_MARGIN_MS)
+  const pageAwaitMs = (timeoutMs: number): number => Math.max(PAGE_AWAIT_MIN_MS, timeoutMs - PAGE_AWAIT_MARGIN_MS)
 
   /**
    * The diagnostic snapshot shared by `GET /state` and `desktop_status`.
@@ -714,7 +854,7 @@ function createBridge(flags) {
    * busy" is here, and every field is either present or absent — never null.
    * @returns the status object.
    */
-  const status = () => {
+  const status = (): BridgeStatus => {
     const seen = agentSeenMsAgo()
     const stale = seen !== null && seen > AGENT_STALE_MS
     const recordView = record === null
@@ -771,7 +911,7 @@ function createBridge(flags) {
    * waiting out the whole deadline to learn that nothing is listening.
    * @returns the reason, or null.
    */
-  const agentUnavailable = () => {
+  const agentUnavailable = (): string | null => {
     if (waiters.length > 0) return null
     if (lastPollAt === 0) return 'no browser half has polled this host half yet; open the DeepSeek Harness GUI page'
     const age = Date.now() - lastPollAt
@@ -784,7 +924,7 @@ function createBridge(flags) {
    * with the answer.
    * @returns the command id, for cancellation.
    */
-  const begin = (task, timeoutMs, settle) => {
+  const begin = (task: CommandDraft, timeoutMs: number, settle: (payload: Answer) => void): string => {
     const id = randomUUID()
     const unavailable = agentUnavailable()
     if (unavailable !== null) {
@@ -799,7 +939,7 @@ function createBridge(flags) {
       })
       return id
     }
-    const entry = { done: false, timer: null, settle }
+    const entry: PendingEntry = { done: false, timer: null, settle }
     entry.timer = setTimeout(() => {
       if (entry.done) return
       entry.done = true
@@ -818,16 +958,16 @@ function createBridge(flags) {
       })
     }, timeoutMs)
     pending.set(id, entry)
-    dispatch({ id, timeoutMs, expiresAt: Date.now() + timeoutMs, ...task })
+    dispatch({ id, timeoutMs, expiresAt: Date.now() + timeoutMs, ...task } as Command)
     return id
   }
 
   /** Forget one command: its caller left before the browser half answered. */
-  const cancel = (id) => {
+  const cancel = (id: string): void => {
     const entry = pending.get(id)
     if (entry !== undefined && !entry.done) {
       entry.done = true
-      clearTimeout(entry.timer)
+      clearTimeout(entry.timer!)
       pending.delete(id)
     }
     const at = queue.findIndex((command) => command.id === id)
@@ -835,9 +975,9 @@ function createBridge(flags) {
   }
 
   /** Submit from the tool face: a promise instead of a held response. */
-  const submitTask = (task, timeoutMs, signal) => new Promise((resolve) => {
+  const submitTask = (task: CommandDraft, timeoutMs: number, signal: AbortSignal | undefined): Promise<Answer> => new Promise<Answer>((resolve) => {
     let settled = false
-    const finish = (payload) => {
+    const finish = (payload: Answer): void => {
       if (settled) return
       settled = true
       resolve(payload)
@@ -863,15 +1003,15 @@ function createBridge(flags) {
    * deadline does, so a stuck expression is reported by the page rather than as
    * a bridge timeout.
    */
-  const submit = (code, timeoutMs, signal, source) =>
+  const submit = (code: string, timeoutMs: number, signal: AbortSignal | undefined, source: string | undefined): Promise<Answer> =>
     submitTask({ code, awaitMs: pageAwaitMs(timeoutMs), ...(source === undefined ? {} : { source }) }, timeoutMs, signal)
 
   /** Submit one recording action to the page's recorder. */
-  const submitRecord = (args, timeoutMs, signal, source) =>
+  const submitRecord = (args: RecordArgs, timeoutMs: number, signal: AbortSignal | undefined, source: string | undefined): Promise<Answer> =>
     submitTask({ kind: 'record', args, ...(source === undefined ? {} : { source }) }, timeoutMs, signal)
 
   /** Submit one structured, read-only inspection to the page. */
-  const submitInspect = (args, timeoutMs, signal, source) =>
+  const submitInspect = (args: InspectArgs, timeoutMs: number, signal: AbortSignal | undefined, source: string | undefined): Promise<Answer> =>
     submitTask({ kind: 'inspect', args, awaitMs: pageAwaitMs(timeoutMs), ...(source === undefined ? {} : { source }) }, timeoutMs, signal)
 
   /**
@@ -883,7 +1023,7 @@ function createBridge(flags) {
    * @param waitMs - how long to wait, in ms.
    * @returns the late answer, or a `NotReady` failure.
    */
-  const waitFor = async (id, waitMs) => {
+  const waitFor = async (id: string, waitMs: number): Promise<Answer> => {
     const deadline = Date.now() + waitMs
     for (;;) {
       pruneRecent()
@@ -911,17 +1051,17 @@ function createBridge(flags) {
    * operator's own face (the command line, which has no session) is never
    * refused, and a session manages only the recording it started.
    */
-  let record = null
+  let record: RecordingState | null = null
 
   /** Why a caller may not act on the recording, or null when it may. */
-  const recordRefusal = (owner) => {
+  const recordRefusal = (owner: SessionHandle | null): string | null => {
     if (record === null) return 'no recording has been started in this host half; start one with action "start"'
     if (owner === null || record.owner === owner) return null
     return `the recording was started by ${record.ownerLabel}; a session reads and stops only the recording it started`
   }
 
   /** Fold one recording answer into what this host half knows about the recording. */
-  const noteRecord = (owner, ownerLabel, args, payload) => {
+  const noteRecord = (owner: SessionHandle | null, ownerLabel: string, args: Pick<RecordingArgs, 'action'>, payload: Answer): void => {
     if (payload.ok !== true || payload.value === null || typeof payload.value !== 'object') return
     if (args.action === 'start') {
       record = {
@@ -950,7 +1090,7 @@ function createBridge(flags) {
    * @param signal - the caller's abort signal.
    * @returns the export answer envelope.
    */
-  const exportRecording = async (owner, ownerLabel, timeoutMs, signal, source) => {
+  const exportRecording = async (owner: SessionHandle | null, ownerLabel: string, timeoutMs: number, signal: AbortSignal | undefined, source: string | undefined): Promise<Answer> => {
     const refusal = recordRefusal(owner)
     if (refusal !== null) {
       const seen = agentSeenMsAgo()
@@ -961,7 +1101,7 @@ function createBridge(flags) {
         ...(seen === null ? {} : { agentSeenMsAgo: seen }),
       }
     }
-    const entries = []
+    const entries: unknown[] = []
     let after = 0
     for (let pass = 0; pass < 10; pass += 1) {
       const payload = await submitRecord({ action: 'read', afterSeq: after, limit: 1000 }, timeoutMs, signal, source)
@@ -1007,7 +1147,7 @@ function createBridge(flags) {
    * @param signal - the caller's abort signal.
    * @returns the answer envelope.
    */
-  const recordAction = (args, owner, ownerLabel, timeoutMs, signal, source) => {
+  const recordAction = (args: RecordingArgs, owner: SessionHandle | null, ownerLabel: string, timeoutMs: number, signal: AbortSignal | undefined, source: string | undefined): Promise<Answer> => {
     const prepared = { ...args }
     if (prepared.action === 'start' && typeof prepared.runId !== 'string') prepared.runId = randomUUID()
     if (prepared.action === RECORD_EXPORT) {
@@ -1025,13 +1165,13 @@ function createBridge(flags) {
         })
       }
     }
-    return submitRecord(prepared, timeoutMs, signal, source).then((payload) => {
+    return submitRecord(prepared as RecordArgs, timeoutMs, signal, source).then((payload) => {
       noteRecord(owner, ownerLabel, prepared, payload)
       return payload
     })
   }
 
-  const onRecord = async (req, res) => {
+  const onRecord = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const refused = refusalOf(req)
     if (refused !== undefined) {
       res.writeHead(refused)
@@ -1047,7 +1187,7 @@ function createBridge(flags) {
     try {
       body = await readBody(req, MAX_BODY_BYTES)
     } catch (error) {
-      sendJson(res, 400, { error: error?.message ?? String(error) })
+      sendJson(res, 400, { error: (error as ThrownValue)?.message ?? String(error) })
       return
     }
     const action = typeof body.action === 'string' ? body.action : ''
@@ -1063,7 +1203,7 @@ function createBridge(flags) {
     }
     const args = recordArgs(action, body)
     if (action === 'start' && typeof args.runId !== 'string') args.runId = randomUUID()
-    const id = begin({ kind: 'record', args, source: routeSource(body) }, timeoutMs, (payload) => {
+    const id = begin({ kind: 'record', args: args as RecordArgs, source: routeSource(body) }, timeoutMs, (payload: Answer) => {
       noteRecord(null, OPERATOR_LABEL, { action }, payload)
       const status = payload.unavailable === true ? 503 : payload.timedOut === true ? 504 : 200
       sendJson(res, status, payload)
@@ -1071,7 +1211,7 @@ function createBridge(flags) {
     req.on('close', () => cancel(id))
   }
 
-  const onExec = async (req, res) => {
+  const onExec = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const refused = refusalOf(req)
     if (refused !== undefined) {
       res.writeHead(refused)
@@ -1087,7 +1227,7 @@ function createBridge(flags) {
     try {
       body = await readBody(req, MAX_BODY_BYTES)
     } catch (error) {
-      sendJson(res, 400, { error: error?.message ?? String(error) })
+      sendJson(res, 400, { error: (error as ThrownValue)?.message ?? String(error) })
       return
     }
     const code = typeof body.code === 'string' ? body.code : ''
@@ -1107,7 +1247,7 @@ function createBridge(flags) {
     req.on('close', () => cancel(id))
   }
 
-  const onNext = (req, res) => {
+  const onNext = (req: IncomingMessage, res: ServerResponse): void => {
     const refused = refusalOf(req)
     if (refused !== undefined) {
       res.writeHead(refused)
@@ -1135,13 +1275,13 @@ function createBridge(flags) {
       return
     }
     const waitMs = queryInt(req, 'wait', DEFAULT_POLL_WAIT_MS, 0, MAX_POLL_WAIT_MS)
-    const waiter = { res, timer: null, done: false }
+    const waiter: Waiter = { res, timer: null, done: false }
     waiters.push(waiter)
     if (waitMs > 0) waiter.timer = setTimeout(() => settleWaiter(waiter), waitMs)
     res.on('close', () => dropWaiter(waiter))
   }
 
-  const onResult = async (req, res) => {
+  const onResult = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const refused = refusalOf(req)
     if (refused !== undefined) {
       res.writeHead(refused)
@@ -1157,13 +1297,13 @@ function createBridge(flags) {
     try {
       body = await readBody(req, MAX_RESULT_BYTES)
     } catch (error) {
-      sendJson(res, 400, { error: error?.message ?? String(error) })
+      sendJson(res, 400, { error: (error as ThrownValue)?.message ?? String(error) })
       return
     }
     const id = typeof body.id === 'string' ? body.id : ''
     // "Nothing to report" is an absent key, never a null: the output schema
     // declares single types only.
-    const payload = {
+    const payload: Answer = {
       id,
       ok: body.ok !== false,
       ...(body.value === undefined ? {} : { value: body.value }),
@@ -1187,14 +1327,14 @@ function createBridge(flags) {
       return
     }
     entry.done = true
-    clearTimeout(entry.timer)
+    clearTimeout(entry.timer!)
     pending.delete(id)
     served += 1
     entry.settle(payload)
     sendJson(res, 200, { ok: true })
   }
 
-  const onState = (req, res) => {
+  const onState = (req: IncomingMessage, res: ServerResponse): void => {
     const refused = refusalOf(req)
     if (refused !== undefined) {
       res.writeHead(refused)
@@ -1210,14 +1350,14 @@ function createBridge(flags) {
   }
 
   /** Take every held caller down; the routes and the tool go with the plugin. */
-  const dispose = () => {
+  const dispose = (): void => {
     for (const waiter of waiters.splice(0)) {
       if (waiter.timer !== null) clearTimeout(waiter.timer)
       waiter.done = true
     }
     for (const [id, entry] of pending) {
       entry.done = true
-      clearTimeout(entry.timer)
+      clearTimeout(entry.timer!)
       entry.settle({
         id,
         ok: false,
@@ -1229,13 +1369,44 @@ function createBridge(flags) {
     record = null
   }
 
-  const onPoll = (listener) => { onPollListener = listener }
+  const onPoll = (listener: () => void): void => { onPollListener = listener }
 
   return { onExec, onNext, onResult, onState, onRecord, onPoll, submit, submitInspect, waitFor, status, recordAction, dispose }
 }
 
+/** A thrown value or error payload, read for its message and stack. */
+interface ErrorLike {
+  name?: unknown
+  message?: unknown
+  stack?: unknown
+}
+
+/**
+ * The status answer as the renderer reads it: the nested objects are JSON the
+ * status answer owns, so nothing but `String()` looks inside them.
+ */
+interface StatusView {
+  agent?: PageValue
+  queue?: unknown
+  pending?: unknown
+  served?: unknown
+  record?: PageValue
+  page?: PageInfo
+  versions?: PageValue
+  limits?: PageValue
+}
+
+/**
+ * The `since` view as the renderer reads it. The page comparison stays JSON the
+ * page owns; `windowMs` is compared directly, so it is always present here.
+ */
+interface SinceViewForRender extends Omit<SinceView, 'page' | 'windowMs'> {
+  windowMs: number
+  page?: PageValue
+}
+
 /** One thrown value as the model reads it: the message, then where it was thrown. */
-function renderError(error) {
+function renderError(error: ErrorLike | null | undefined): string {
   const name = String(error?.name ?? 'Error')
   const message = String(error?.message ?? 'the expression failed')
   const stack = typeof error?.stack === 'string'
@@ -1245,7 +1416,7 @@ function renderError(error) {
 }
 
 /** The line naming the page that answered: which document, and whether it can animate. */
-function renderPage(page) {
+function renderPage(page: PageInfo | null | undefined): string | null {
   if (page === null || page === undefined || typeof page !== 'object') return null
   const where = typeof page.href === 'string' ? page.href : '(page unknown)'
   const title = typeof page.title === 'string' && page.title !== '' ? ` "${page.title}"` : ''
@@ -1255,7 +1426,7 @@ function renderPage(page) {
 }
 
 /** The console output an expression produced, one line per entry. */
-function renderConsole(entries) {
+function renderConsole(entries: ConsoleEntry[]): string {
   const lines = [`console: ${String(entries.length)} entr${entries.length === 1 ? 'y' : 'ies'}`]
   for (const entry of entries.slice(0, CONSOLE_RENDERED)) {
     const level = String(entry?.level ?? 'log')
@@ -1274,7 +1445,7 @@ function renderConsole(entries) {
  * know whether to read again, so the same facts are stated beside the JSON.
  * @returns the line, or null for an answer that is not a read.
  */
-function renderRecordCoverage(value) {
+function renderRecordCoverage(value: PageValue): string | null {
   if (value === null || typeof value !== 'object' || !Array.isArray(value.entries)) return null
   const head = [`record: ${String(value.entries.length)} entr${value.entries.length === 1 ? 'y' : 'ies'}`]
   if (typeof value.nextSeq === 'number') head.push(`through seq ${String(value.nextSeq)}`)
@@ -1292,7 +1463,7 @@ function renderRecordCoverage(value) {
 }
 
 /** The model-facing text for one `desktop_status` answer. */
-function renderStatus(value) {
+function renderStatus(value: StatusView | null | undefined): string {
   const agent = value?.agent ?? {}
   const last = typeof agent.lastPollMsAgo === 'number' ? `${String(agent.lastPollMsAgo)}ms ago` : 'never'
   const lines = [`agent: ${String(agent.state ?? 'unknown')}, last poll ${last}, waiters ${String(agent.waiters ?? 0)}`]
@@ -1314,7 +1485,7 @@ function renderStatus(value) {
 }
 
 /** A one-line coverage summary for a structured inspect answer. */
-function renderInspectCoverage(value) {
+function renderInspectCoverage(value: PageValue): string | null {
   if (value === null || typeof value !== 'object' || typeof value.coverage !== 'object' || value.coverage === null) return null
   const coverage = value.coverage
   const parts = [`inspect: ${String(coverage.selectorCount ?? 0)} selector(s)`]
@@ -1328,7 +1499,7 @@ function renderInspectCoverage(value) {
 
 
 /** The page changes one caller accumulated since its previous call. */
-function renderSince(since) {
+function renderSince(since: SinceViewForRender | null | undefined): string | null {
   if (since === null || since === undefined || typeof since !== 'object') return null
   const seconds = typeof since.windowMs === 'number' ? (since.windowMs / 1000).toFixed(1) : '0.0'
   if (since.baseline === true) {
@@ -1354,7 +1525,7 @@ function renderSince(since) {
 }
 
 /** The model-facing text for one bridge answer. */
-function renderToolResult(value) {
+function renderToolResult(value: Answer): string {
   if (value === null || value === undefined) return 'the bridge returned nothing'
   if (value.ok === false) {
     const lines = [renderError(value.error ?? {})]
@@ -1378,7 +1549,7 @@ function renderToolResult(value) {
     try {
       text = JSON.stringify(value.value, null, 1)
     } catch (error) {
-      text = `unserialisable value: ${error?.message ?? error}`
+      text = `unserialisable value: ${(error as ThrownValue)?.message ?? error}`
     }
   }
   if (text === undefined) text = 'undefined'
@@ -1397,9 +1568,19 @@ function renderToolResult(value) {
   if (inspected !== null) blocks.push(inspected)
   const page = renderPage(value.page)
   if (page !== null) blocks.push(page)
-  const since = renderSince(value.since)
+  const since = renderSince(value.since as SinceViewForRender | undefined)
   if (since !== null) blocks.push(since)
   return blocks.join('\n\n')
+}
+
+/** One `desktop_inspect` call's arguments, before they are normalized. */
+interface InspectRequest {
+  selectors?: unknown
+  fields?: unknown
+  styleProps?: unknown
+  waitMs?: unknown
+  limit?: unknown
+  budget?: unknown
 }
 
 /**
@@ -1412,9 +1593,9 @@ function renderToolResult(value) {
  * @returns the normalized inspect arguments.
  * @throws when no selector is supplied.
  */
-function normalizeInspectArgs(args) {
+function normalizeInspectArgs(args: InspectRequest): InspectArgs {
   const selectors = Array.isArray(args.selectors)
-    ? args.selectors.filter((selector) => typeof selector === 'string' && selector.trim() !== '').slice(0, INSPECT_MAX_SELECTORS)
+    ? args.selectors.filter((selector: unknown) => typeof selector === 'string' && selector.trim() !== '').slice(0, INSPECT_MAX_SELECTORS)
     : []
   if (selectors.length === 0) {
     throw new Error(`desktop_inspect needs \`selectors\`: 1-${String(INSPECT_MAX_SELECTORS)} CSS selectors`)
@@ -1423,7 +1604,7 @@ function normalizeInspectArgs(args) {
     ? args.fields.filter((field) => INSPECT_FIELDS.includes(field))
     : ['count', 'rect', 'text', 'attrs']
   const styleProps = Array.isArray(args.styleProps)
-    ? args.styleProps.filter((prop) => typeof prop === 'string' && prop !== '').slice(0, 20)
+    ? args.styleProps.filter((prop: unknown) => typeof prop === 'string' && prop !== '').slice(0, 20)
     : []
   return {
     selectors,
@@ -1435,23 +1616,65 @@ function normalizeInspectArgs(args) {
   }
 }
 
+/** The answer envelope the output schema declares, as `defineTool` infers it. */
+type AnswerSchemaValue = InferValue<typeof ANSWER_SCHEMA>
+
+/** The status answer the output schema declares, as `defineTool` infers it. */
+type StatusSchemaValue = InferValue<typeof STATUS_SCHEMA>
+
+/** One route handler the web server hands a raw request and response. */
+type RouteHandler = (req: IncomingMessage, res: ServerResponse) => void
+
+/** One row this plugin adds to the boot page's injection table. */
+interface BootInjectionRow {
+  kind: 'script'
+  placement: 'head'
+  text: string
+}
+
+/** What this plugin needs from the host's web server service. */
+interface WebServerLike {
+  /** The port the server bound, once it has one. */
+  port?: number
+  register(route: { kind: 'exact'; path: string; handler: RouteHandler }): () => void
+}
+
+/** What this plugin needs from the host's tool registry service. */
+interface ToolRegistryLike {
+  register(definition: ToolDefinition): () => void
+}
+
+/** The scope each surface registers itself in. */
+interface PluginScope {
+  webServer: WebServerLike
+  tools: ToolRegistryLike
+  effect(callback: () => void | (() => void), label: string): void
+  on?(event: string, listener: (table: BootInjectionRow[]) => void): () => void
+}
+
+/** The host plugin context, in the shape this plugin calls it. */
+interface PluginContext extends PluginScope {
+  logger?: { warn?(message: string): void }
+  inject?(services: string[], callback: (scope: PluginScope) => void): void
+}
+
 /**
  * Register the bridge routes and the model-facing tool.
  * @param ctx - host plugin context.
  */
-export function apply(ctx) {
-  const flags = { tool: false }
+export function apply(ctx: PluginContext) {
+  const flags: BridgeFlags = { tool: false }
   const bridge = createBridge(flags)
 
-  const registerRoutes = (scope) => {
+  const registerRoutes = (scope: PluginScope): void => {
     scope.effect(() => {
-      const disposers = []
-      const warn = (message) => ctx.logger?.warn?.(`dsh-desktop-bridge: ${message}`)
-      const add = (path, handler) => {
+      const disposers: Array<() => void> = []
+      const warn = (message: string): void => ctx.logger?.warn?.(`dsh-desktop-bridge: ${message}`)
+      const add = (path: string, handler: RouteHandler): void => {
         try {
           disposers.push(scope.webServer.register({ kind: 'exact', path, handler }))
         } catch (error) {
-          warn(`route ${path} unavailable: ${error?.message ?? error}`)
+          warn(`route ${path} unavailable: ${(error as ThrownValue)?.message ?? error}`)
         }
       }
       add(EXEC_PATH, bridge.onExec)
@@ -1464,14 +1687,14 @@ export function apply(ctx) {
       // injection table is collected after the server binds (the desktop
       // collects it once at startup, `dsh web` on every index it serves).
       const endpointFile = join(endpointDirectory(), `${process.pid}.json`)
-      let recordedPort
+      let recordedPort: number | undefined
       // What `state` reports about the endpoint file, so a command line that
       // cannot find it can ask the host half why.
       flags.endpoint = { file: endpointFile, port: null, error: null }
       const recordEndpoint = () => {
         const port = scope.webServer.port
         if (typeof port !== 'number') {
-          flags.endpoint.error = `the web server reports no port (${typeof port})`
+          flags.endpoint!.error = `the web server reports no port (${typeof port})`
           return
         }
         if (port === recordedPort) return
@@ -1479,15 +1702,15 @@ export function apply(ctx) {
           mkdirSync(endpointDirectory(), { recursive: true })
           writeFileSync(endpointFile, JSON.stringify({ port, pid: process.pid, at: Date.now() }))
           recordedPort = port
-          flags.endpoint.port = port
-          flags.endpoint.error = null
+          flags.endpoint!.port = port
+          flags.endpoint!.error = null
         } catch (error) {
-          flags.endpoint.error = String(error?.message ?? error)
-          warn(`endpoint file ${endpointFile} unwritable: ${flags.endpoint.error}`)
+          flags.endpoint!.error = String((error as ThrownValue)?.message ?? error)
+          warn(`endpoint file ${endpointFile} unwritable: ${flags.endpoint!.error}`)
         }
       }
       if (typeof scope.on === 'function') {
-        disposers.push(scope.on('webserver/index-inject', (table) => {
+        disposers.push(scope.on('webserver/index-inject', (table: BootInjectionRow[]): void => {
           table.push({ kind: 'script', placement: 'head', text: BOOT_LOADER })
           recordEndpoint()
         }))
@@ -1508,7 +1731,7 @@ export function apply(ctx) {
     }, 'dsh-desktop-bridge: routes')
   }
 
-  const registerTool = (scope) => {
+  const registerTool = (scope: PluginScope): void => {
     scope.effect(() => {
       const definition = defineTool({
         name: TOOL_NAME,
@@ -1518,12 +1741,12 @@ export function apply(ctx) {
           // The bridge answer: `value` and `error` are arbitrary JSON, covered
           // by the author-only `json` node; the rest is a fixed shape.
           schema: ANSWER_SCHEMA,
-          render: (_args, value) => [{ type: 'text', text: renderToolResult(value) }],
+          render: (_args, value) => [{ type: 'text', text: renderToolResult(value as Answer) }],
         },
         execute: (args, exec) => {
           assertDeclaredArguments(TOOL_NAME, Object.keys(TOOL_PARAMETERS), args)
           const spill = typeof args.spill === 'string' && args.spill !== '' ? args.spill : null
-          if (spill !== null) return Promise.resolve(readSpill(spill, args.offset))
+          if (spill !== null) return Promise.resolve(readSpill(spill, args.offset)) as Promise<AnswerSchemaValue>
           const code = typeof args.code === 'string' ? args.code : ''
           if (code.trim() === '') {
             throw new Error('desktop_eval needs `code` (an expression to evaluate) or `spill` (the id of an earlier answer to continue reading)')
@@ -1533,7 +1756,7 @@ export function apply(ctx) {
             clampInt(args.timeoutMs, DEFAULT_EXEC_TIMEOUT_MS, 1000, MAX_EXEC_TIMEOUT_MS),
             exec === undefined || exec === null ? undefined : exec.signal,
             sourceOf(exec),
-          ).then(withSpill)
+          ).then(withSpill) as Promise<AnswerSchemaValue>
         },
       })
       const recorder = defineTool({
@@ -1542,7 +1765,7 @@ export function apply(ctx) {
         parameters: RECORD_PARAMETERS,
         output: {
           schema: ANSWER_SCHEMA,
-          render: (_args, value) => [{ type: 'text', text: renderToolResult(value) }],
+          render: (_args, value) => [{ type: 'text', text: renderToolResult(value as Answer) }],
         },
         execute: (args, exec) => {
           assertDeclaredArguments(RECORD_TOOL_NAME, Object.keys(RECORD_PARAMETERS), args)
@@ -1558,7 +1781,7 @@ export function apply(ctx) {
             clampInt(args.timeoutMs, RECORD_TIMEOUT_MS, 1000, MAX_EXEC_TIMEOUT_MS),
             exec === undefined || exec === null ? undefined : exec.signal,
             sourceOf(exec),
-          ).then(withSpill)
+          ).then(withSpill) as Promise<AnswerSchemaValue>
         },
       })
       const statusTool = defineTool({
@@ -1567,11 +1790,11 @@ export function apply(ctx) {
         parameters: STATUS_PARAMETERS,
         output: {
           schema: STATUS_SCHEMA,
-          render: (_args, value) => [{ type: 'text', text: renderStatus(value) }],
+          render: (_args, value) => [{ type: 'text', text: renderStatus(value as StatusView) }],
         },
         execute: (args) => {
           assertDeclaredArguments(STATUS_TOOL_NAME, [], args ?? {})
-          return Promise.resolve(bridge.status())
+          return Promise.resolve(bridge.status()) as Promise<StatusSchemaValue>
         },
       })
       const waitTool = defineTool({
@@ -1580,13 +1803,13 @@ export function apply(ctx) {
         parameters: WAIT_PARAMETERS,
         output: {
           schema: ANSWER_SCHEMA,
-          render: (_args, value) => [{ type: 'text', text: renderToolResult(value) }],
+          render: (_args, value) => [{ type: 'text', text: renderToolResult(value as Answer) }],
         },
         execute: (args) => {
           assertDeclaredArguments(WAIT_TOOL_NAME, Object.keys(WAIT_PARAMETERS), args)
           const commandId = typeof args.commandId === 'string' ? args.commandId : ''
           if (commandId.trim() === '') throw new Error('desktop_wait needs `commandId` (the id an earlier answer reported)')
-          return bridge.waitFor(commandId, clampInt(args.waitMs, 5000, 0, WAIT_MAX_MS)).then(withSpill)
+          return bridge.waitFor(commandId, clampInt(args.waitMs, 5000, 0, WAIT_MAX_MS)).then(withSpill) as Promise<AnswerSchemaValue>
         },
       })
       const inspectTool = defineTool({
@@ -1596,7 +1819,7 @@ export function apply(ctx) {
         isConcurrencySafe: () => true,
         output: {
           schema: ANSWER_SCHEMA,
-          render: (_args, value) => [{ type: 'text', text: renderToolResult(value) }],
+          render: (_args, value) => [{ type: 'text', text: renderToolResult(value as Answer) }],
         },
         execute: (args, exec) => {
           assertDeclaredArguments(INSPECT_TOOL_NAME, Object.keys(INSPECT_PARAMETERS), args)
@@ -1606,7 +1829,7 @@ export function apply(ctx) {
             timeoutMs,
             exec === undefined || exec === null ? undefined : exec.signal,
             sourceOf(exec),
-          ).then(withSpill)
+          ).then(withSpill) as Promise<AnswerSchemaValue>
         },
       })
       const disposers = [

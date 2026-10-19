@@ -4,8 +4,12 @@
   "description": "Debug bridge into the DSH browser half: run expressions in the GUI page from a command line or a model tool. | DSH 调试桥接：从命令行或模型工具在 GUI 页面里执行表达式。",
   "type": "module",
   "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
   "exports": {
-    ".": "./lib/index.js",
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
@@ -49,8 +53,13 @@
     "@deepseek-ai/dsh-tools": "*"
   },
   "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm run build && npm test",
     "bridge": "node bin/bridge.cjs",
-    "test": "node test/bridge.test.cjs"
+    "test": "node test/bridge.test.cjs",
+    "prepack": "npm run build"
   },
   "keywords": [
     "dsh",
@@ -62,5 +71,10 @@
     "devtools"
   ],
   "license": "MIT",
-  "author": "Nwflower"
+  "author": "Nwflower",
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "tsdown": "^0.23.1",
+    "typescript": "^7.0.2"
+  }
 }
