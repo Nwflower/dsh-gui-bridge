@@ -174,6 +174,14 @@ async function main() {
   check('the tool refuses an argument it does not declare', unknownArgs !== null && unknownArgs.includes('unknown argument "cod"'), String(unknownArgs))
 
   const clientSource = readFileSync(join(ROOT, 'lib', 'client.js'), 'utf8')
+  // The client module system keys boot graph rows by the package name, so a
+  // bundle registering anything else loads without registering its row: the
+  // page reports "import failed", the loader retries the row's own URL, and the
+  // second execution throws a duplicate-registration error.
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  const registeredId = /__ModuleLoader__\.load\(\{\s*id:\s*"([^"]+)"/.exec(clientSource)?.[1]
+  check('the client bundle registers the package name as its row id', registeredId === manifest.name,
+    'registered ' + String(registeredId) + ', package name ' + String(manifest.name))
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://x')
     const handler = routes.get(url.pathname)

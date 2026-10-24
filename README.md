@@ -6,12 +6,14 @@ Debug bridge into the DSH browser half: run expressions in the GUI page from a c
 
 ## 命名
 
-发布名（npm 包名、仓库名）是 **`dsh-gui-bridge`**：`dsh-desktop-bridge` 在 npm 与 GitHub 上都已被别人的插件占用。改名只动发布名，运行时标识保持原样：
+发布名（npm 包名、仓库名）是 **`dsh-gui-bridge`**：`dsh-desktop-bridge` 在 npm 与 GitHub 上都已被别人的插件占用。改名只动发布名，宿主半边的运行时标识保持原样：
 
 - 插件 id、路由前缀、日志前缀仍是 `dsh-desktop-bridge`；
 - 数据目录仍是 `$DSH_HOME/dsh-desktop-bridge/`（端点、启动脚本、录制、结果）；
 - `cordis.patch.yml` 里的 `name` 是「从 profile 目录解析的模块说明符」，它必须等于包名，因此已改成 `dsh-gui-bridge`；
 - 命令行同时提供 `dsh-gui-bridge` 与 `dsh-desktop-bridge` 两个名字，指向同一个入口；下文示例沿用后者。
+
+**浏览器半边不能保留旧 id**：客户端模块系统用**包名**给 boot graph 的每一行做 id（`@deepseek-ai/dsh-client-modules`：the manifest package name identifies the browser module），`lib/client.js` 注册的 id 必须等于 `package.json` 的 `name`。旧 id 只影响宿主半边；注册成 `dsh-desktop-bridge` 会让 `dsh-gui-bridge` 那一行永远等不到工厂，页面里报 `import failed`，并在回退重取同一个 bundle 时抛 `duplicate factory registration`。
 
 ## 构建
 
@@ -33,7 +35,7 @@ npm run verify     # typecheck + build + test
 | `src/host/index.ts` | `lib/index.js` + `lib/index.d.ts` | ESM，宿主进程按 `exports["."]` 导入并调用 `apply(ctx)` |
 | `src/client/index.ts` | `lib/client.js` | CJS，包在页面模块加载器的工厂包装里 |
 
-浏览器半边的 `window.__ModuleLoader__.load({ id, factory })` 包装、`module`/`exports` 骨架与 `Symbol.toStringTag` **由构建生成**（`tsdown.config.ts` 的 `banner`/`intro`/`footer`），源码只是一个普通模块，导出 `apply`。它上报的 `CLIENT_VERSION` 由构建从 `package.json` 注入，不再手抄。
+浏览器半边的 `window.__ModuleLoader__.load({ id, factory })` 包装、`module`/`exports` 骨架与 `Symbol.toStringTag` **由构建生成**（`tsdown.config.ts` 的 `banner`/`intro`/`footer`），源码只是一个普通模块，导出 `apply`；`id` 取 `package.json` 的 `name`（客户端模块系统按包名索引 boot graph 行）。它上报的 `CLIENT_VERSION` 由构建从 `package.json` 注入，不再手抄。
 
 两半之间的线协议类型在 `src/shared/protocol.ts`：命令、录制与检查参数、回答信封都从这里来，改名会同时落在两侧。`bin/bridge.cjs`（命令行）与 `probes/*.js`（页面探针）保持纯 JS，不参与构建。
 

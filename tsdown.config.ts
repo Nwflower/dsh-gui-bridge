@@ -18,11 +18,16 @@ import { defineConfig } from 'tsdown'
 const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8'))
 
 /**
- * The plugin's runtime identity. Deliberately NOT `pkg.name`: the published
+ * The host half's runtime identity. Deliberately NOT `pkg.name`: the published
  * package is `dsh-gui-bridge` (the old name was taken on npm), while the
- * plugin id, the route prefix, the log prefix and the client module's loader
- * id all stay `dsh-desktop-bridge` so existing endpoints, boot scripts and
- * muscle memory keep working. See README.md, "命名".
+ * plugin id, the route prefix, the log prefix and the data directory stay
+ * `dsh-desktop-bridge` so existing endpoints, boot scripts and muscle memory
+ * keep working. See README.md, "命名".
+ *
+ * The browser half is the exception: the client module system keys its boot
+ * graph rows by the package name, so `lib/client.js` must register under
+ * `pkg.name` — a bundle that registers any other id is loaded without ever
+ * registering its row. See the `banner` below.
  */
 const PLUGIN_ID = 'dsh-desktop-bridge'
 
@@ -87,8 +92,9 @@ export default defineConfig([
     outputOptions: {
       entryFileNames: 'client.js',
       // The closure-factory handoff every `dsh.client` package's ./client export
-      // must use. `id` is the plugin id, not the package name (see PLUGIN_ID).
-      banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {`,
+      // must use. `id` is the package name, which is what the client module
+      // system keys the boot graph row by — never PLUGIN_ID.
+      banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(pkg.name)}, factory: (require) => {`,
       intro: 'var module = { exports: {} }; var exports = module.exports;',
       footer: 'return module.exports; } });',
     },
